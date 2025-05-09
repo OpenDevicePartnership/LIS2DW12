@@ -10,6 +10,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use crate::Reserved0::Res0;
 use embedded_hal_async::i2c::I2c;
 
 pub mod registers;
@@ -289,9 +290,216 @@ impl<I2C: embedded_hal_async::i2c::I2c> Lis2dw12<I2C> {
     /// Returns the previous value of the Control3 register
     pub async fn set_self_test_mode(&mut self, self_test: Control3SelfTest) -> Result<u8, I2C::Error> {
         // Create ControlReg3 with self test field (the others will not be modified due to the update mask)
-        let reg: u8 = ControlReg3::new(false, false, Reserved0::Res0, false, false, false, self_test).into();
+        let reg: u8 = ControlReg3::new(false, false, Res0, false, false, false, self_test).into();
         self.modify_reg_field(Register::Control3, reg, SELF_TEST_MODE_MASK)
             .await
+    }
+
+    pub async fn accel_self_test(&mut self) -> Result<bool, I2C::Error> {
+        // Self-test parameters
+        const LOW_DIFF_MGS: f32 = 70.0;
+        const HIGH_DIFF_MGS: f32 = 1500.0;
+        const TEST_SAMPLES: usize = 5;
+        const TEST_STAGE_SLEEP_MS: usize = 100;
+        const MAX_SAMPLE_ATTEMPTS: usize = 2 * TEST_SAMPLES * TEST_STAGE_SLEEP_MS;
+
+        let mut avg_x_pos: f32 = 0.0;
+        let mut avg_y_pos: f32 = 0.0;
+        let mut avg_z_pos: f32 = 0.0;
+
+        let mut avg_x_neg: f32 = 0.0;
+        let mut avg_y_neg: f32 = 0.0;
+        let mut avg_z_neg: f32 = 0.0;
+
+        let mut avg_x_unbiased: f32 = 0.0;
+        let mut avg_y_unbiased: f32 = 0.0;
+        let mut avg_z_unbiased: f32 = 0.0;
+
+        // 1. Configure self-test settings
+        // Control 1: 1600 HZ, High-Performance, 14bit resolution, LowPower1, 50 HZ
+        let control1: u8 = self
+            .modify_reg_field(
+                Register::Control1,
+                ControlReg1::new(
+                    registers::Control1LowPowerMode::LowPower1,
+                    registers::Control1ModeSelect::HighPerformance,
+                    registers::Control1DataRate::HiLo50Hz,
+                )
+                .into(),
+                0xFF, // Update the entire register
+            )
+            .await?;
+
+        // Control 2: Enable Block Data Update
+        let control2: u8 = self
+            .modify_reg_field(
+                Register::Control2,
+                ControlReg2::new(
+                    false, false, false, true, // Block Data Update:
+                    false, Res0, false, false,
+                )
+                .into(),
+                0b1000,
+            )
+            .await?;
+
+        // Control 3: Single Data Conversion disabled
+        let control3: u8 = self
+            .modify_reg_field(
+                Register::Control3,
+                ControlReg3::new(
+                    false, // Single data conversion mode disabled
+                    false, // Single data conversion mode enabled by INT2 external trigger
+                    Res0,
+                    false,
+                    false,
+                    false,
+                    registers::Control3SelfTest::NormalMode, // Enabled after all controls set
+                )
+                .into(),
+                0b11, // Single data conversion mode bits
+            )
+            .await?;
+
+        // Control 6: Low noise Config Disabled, Full Scale Range 4g
+        let control6: u8 = self
+            .modify_reg_field(
+                Register::Control6,
+                ControlReg6::new(
+                    [Res0, Res0],
+                    false, // Disable low noise
+                    false,
+                    Control6FullScale::Scale4g,
+                    Control6BandwidthSelection::ODRdiv2,
+                )
+                .into(),
+                0b00110100, // Full Scale + Low Noise
+            )
+            .await?;
+
+        // 2. Record unbiased accelerometer samples
+        embassy_time::Timer::after_millis(TEST_STAGE_SLEEP_MS as u64).await;
+        self.flush_samples().await?;
+
+        let mut sample: usize = 0;
+        let mut attempts: usize = 0;
+        while sample < TEST_SAMPLES && attempts < MAX_SAMPLE_ATTEMPTS {
+            if self.status().await?.drdy() {
+                let unbiased_acc: (f32, f32, f32) = self.acc_mgs().await?;
+                avg_x_unbiased += unbiased_acc.0;
+                avg_y_unbiased += unbiased_acc.1;
+                avg_z_unbiased += unbiased_acc.2;
+                sample += 1;
+            }
+            attempts += 1;
+        }
+        if sample == 0 {
+            return Ok(false);
+        }
+        avg_x_unbiased /= TEST_SAMPLES as f32;
+        avg_y_unbiased /= TEST_SAMPLES as f32;
+        avg_z_unbiased /= TEST_SAMPLES as f32;
+
+        // 3. Enable Self-Test mode, beginning with Positive Sign
+        let mut _control3 = self
+            .set_self_test_mode(registers::Control3SelfTest::PositiveSign)
+            .await?;
+
+        embassy_time::Timer::after_millis(TEST_STAGE_SLEEP_MS as u64).await;
+        self.flush_samples().await?;
+
+        // 4. Record positive accelerometer samples
+        sample = 0;
+        attempts = 0;
+        while sample < TEST_SAMPLES && attempts < MAX_SAMPLE_ATTEMPTS {
+            if self.status().await?.drdy() {
+                let pos_acc: (f32, f32, f32) = self.acc_mgs().await?;
+                avg_x_pos += pos_acc.0;
+                avg_y_pos += pos_acc.1;
+                avg_z_pos += pos_acc.2;
+                sample += 1;
+            }
+            attempts += 1;
+        }
+        if sample == 0 {
+            return Ok(false);
+        }
+        avg_x_pos /= TEST_SAMPLES as f32;
+        avg_y_pos /= TEST_SAMPLES as f32;
+        avg_z_pos /= TEST_SAMPLES as f32;
+
+        // 5. Set Negative Sign Self-Test
+        _control3 = self
+            .set_self_test_mode(registers::Control3SelfTest::NegativeSign)
+            .await?;
+
+        embassy_time::Timer::after_millis(TEST_STAGE_SLEEP_MS as u64).await;
+        self.flush_samples().await?;
+
+        // 6. Record negative self-test accelerometer samples
+        sample = 0;
+        attempts = 0;
+        while sample < TEST_SAMPLES && attempts < MAX_SAMPLE_ATTEMPTS {
+            if self.status().await?.drdy() {
+                let neg_acc: (f32, f32, f32) = self.acc_mgs().await?;
+                avg_x_neg += neg_acc.0;
+                avg_y_neg += neg_acc.1;
+                avg_z_neg += neg_acc.2;
+                sample += 1;
+            }
+            attempts += 1;
+        }
+        if sample == 0 {
+            return Ok(false);
+        }
+        avg_x_neg /= TEST_SAMPLES as f32;
+        avg_y_neg /= TEST_SAMPLES as f32;
+        avg_z_neg /= TEST_SAMPLES as f32;
+
+        // 7. Reset the changed accelerometer registers to their previous setting
+        self.write_reg(Register::Control1, control1).await?;
+        self.write_reg(Register::Control2, control2).await?;
+        self.write_reg(Register::Control3, control3).await?;
+        self.write_reg(Register::Control6, control6).await?;
+
+        // 8. Compare differences to expected values
+        // Average across test samples
+        let pos_dif_x: f32 = avg_x_pos - avg_x_unbiased;
+        let pos_dif_y: f32 = avg_y_pos - avg_y_unbiased;
+        let pos_dif_z: f32 = avg_z_pos - avg_z_unbiased;
+        let neg_dif_x: f32 = avg_x_unbiased - avg_x_neg;
+        let neg_dif_y: f32 = avg_y_unbiased - avg_y_neg;
+        let neg_dif_z: f32 = avg_z_unbiased - avg_z_neg;
+
+        // Ensure all differences line up within defined range
+        let res: bool = pos_dif_x > LOW_DIFF_MGS
+            && pos_dif_x < HIGH_DIFF_MGS
+            && pos_dif_y > LOW_DIFF_MGS
+            && pos_dif_y < HIGH_DIFF_MGS
+            && pos_dif_z > LOW_DIFF_MGS
+            && pos_dif_z < HIGH_DIFF_MGS
+            && neg_dif_x > LOW_DIFF_MGS
+            && neg_dif_x < HIGH_DIFF_MGS
+            && neg_dif_y > LOW_DIFF_MGS
+            && neg_dif_y < HIGH_DIFF_MGS
+            && neg_dif_z > LOW_DIFF_MGS
+            && neg_dif_z < HIGH_DIFF_MGS;
+
+        Ok(res)
+    }
+
+    /// Flush Samples: Reads an accelerometer sample if the data is ready
+    /// For use in Block Data Update mode
+    async fn flush_samples(&mut self) -> Result<u8, I2C::Error> {
+        let mut samples: u8 = 0;
+
+        let status: StatusReg = self.status().await?;
+        if status.drdy() {
+            let _acc = self.acc().await?;
+            samples += 1;
+        }
+
+        Ok(samples)
     }
 
     // -------------------------- Helper Functions --------------------------
